@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/juju/errors"
 )
@@ -39,6 +40,9 @@ const (
 	UNCHANGED
 )
 
+const oldFilePrefix string = "--- a/"
+const newFilePrefix string = "+++ b/"
+
 type DiffLine struct {
 	Mode     DiffLineMode
 	Number   int
@@ -59,14 +63,39 @@ type DiffFile struct {
 }
 
 type Diff struct {
+	PullID uint `sql:"index"`
+
+	mux   sync.RWMutex
 	Files []*DiffFile
 	Raw   string `sql:"type:text"`
-
-	PullID uint `sql:"index"`
 }
 
-func (d *Diff) addFile(file *DiffFile) {
-	d.Files = append(d.Files, file)
+type errorHandler struct {
+	mux  sync.RWMutex
+	errs []error
+}
+
+func (eh *errorHandler) hasErrors() bool {
+	eh.mux.RLock()
+	defer eh.mux.RUnlock()
+
+	hasErrors := len(eh.errs) > 0
+	return hasErrors
+}
+
+func (eh *errorHandler) appendError(err error) {
+	eh.mux.Lock()
+	defer eh.mux.Unlock()
+
+	eh.errs = append(eh.errs, err)
+}
+
+func (d *Diff) appendFile(file *DiffFile) {
+	d.mux.Lock()
+	defer d.mux.Unlock()
+
+	files := d.Files
+	d.Files = append(files, file)
 }
 
 // Changed returns a map of filename to lines changed in that file. Deleted
@@ -114,128 +143,144 @@ func lineMode(line string) (*DiffLineMode, error) {
 // Parse takes a diff, such as produced by "git diff", and parses it into a
 // Diff struct.
 func Parse(diffString string) (*Diff, error) {
-	var diff Diff
-	diff.Raw = diffString
+	diff := &Diff{Raw: diffString}
+	eh := &errorHandler{}
 	lines := strings.Split(diffString, "\n")
 
-	var file *DiffFile
-	var hunk *diffHunk
+	lineLen := len(lines)
+	wg := &sync.WaitGroup{}
+	wg.Add(lineLen)
+
+	// Parse each line of diff.
+	for idx, l := range lines {
+		var diffPosCount int
+
+		go generateFiles(wg, eh, diff, diffPosCount, idx, l)
+
+		if eh.hasErrors() {
+			// TODO: Return all errors
+			return nil, eh.errs[0]
+		}
+	}
+	wg.Wait()
+
+	return diff, nil
+}
+
+func generateFiles(wg *sync.WaitGroup, eh *errorHandler, diff *Diff, diffPosCount int, idx int, l string) {
+	defer wg.Done()
+
 	var ADDEDCount int
 	var REMOVEDCount int
 	var inHunk bool
-	oldFilePrefix := "--- a/"
-	newFilePrefix := "+++ b/"
-
-	var diffPosCount int
 	var firstHunkInFile bool
-	// Parse each line of diff.
-	for _, l := range lines {
-		diffPosCount++
-		switch {
-		case strings.HasPrefix(l, "diff "):
-			inHunk = false
 
-			// Start a new file.
-			file = &DiffFile{}
-			diff.Files = append(diff.Files, file)
-			firstHunkInFile = true
+	diffPosCount++
+	var file *DiffFile
+	var hunk *diffHunk
 
-			// File mode.
-			file.Mode = MODIFIED
-		case l == "+++ /dev/null":
-			file.Mode = DELETED
-		case l == "--- /dev/null":
-			file.Mode = NEW
-		case strings.HasPrefix(l, oldFilePrefix):
-			file.OrigName = strings.TrimPrefix(l, oldFilePrefix)
-		case strings.HasPrefix(l, newFilePrefix):
-			file.NewName = strings.TrimPrefix(l, newFilePrefix)
-		case strings.HasPrefix(l, "@@ "):
-			if firstHunkInFile {
-				diffPosCount = 0
-				firstHunkInFile = false
-			}
+	switch {
+	case strings.HasPrefix(l, "diff "):
+		inHunk = false
 
-			inHunk = true
-			// Start new hunk.
-			hunk = &diffHunk{}
-			file.Hunks = append(file.Hunks, hunk)
+		// Start a new file.
+		file = &DiffFile{}
+		diff.appendFile(file)
+		firstHunkInFile = true
 
-			// Parse hunk heading for ranges
-			re := regexp.MustCompile(`@@ \-(\d+),(\d+) \+(\d+),?(\d+)? @@`)
-			m := re.FindStringSubmatch(l)
-			a, err := strconv.Atoi(m[1])
+		// File mode.
+		file.Mode = MODIFIED
+	case l == "+++ /dev/null":
+		file.Mode = DELETED
+	case l == "--- /dev/null":
+		file.Mode = NEW
+	// case strings.HasPrefix(l, oldFilePrefix):
+	// 	file.OrigName = strings.TrimPrefix(l, oldFilePrefix)
+	// case strings.HasPrefix(l, newFilePrefix):
+	// 	file.NewName = strings.TrimPrefix(l, newFilePrefix)
+	case strings.HasPrefix(l, "@@ "):
+		if firstHunkInFile {
+			diffPosCount = 0
+			firstHunkInFile = false
+		}
+
+		inHunk = true
+		// Start new hunk.
+		hunk = &diffHunk{}
+		file.Hunks = append(file.Hunks, hunk)
+
+		// Parse hunk heading for ranges
+		re := regexp.MustCompile(`@@ \-(\d+),(\d+) \+(\d+),?(\d+)? @@`)
+		m := re.FindStringSubmatch(l)
+		a, err := strconv.Atoi(m[1])
+		if err != nil {
+			eh.appendError(err)
+		}
+		b, err := strconv.Atoi(m[2])
+		if err != nil {
+			eh.appendError(err)
+		}
+		c, err := strconv.Atoi(m[3])
+		if err != nil {
+			eh.appendError(err)
+		}
+		d := c
+		if len(m[4]) > 0 {
+			d, err = strconv.Atoi(m[4])
 			if err != nil {
-				return nil, err
-			}
-			b, err := strconv.Atoi(m[2])
-			if err != nil {
-				return nil, err
-			}
-			c, err := strconv.Atoi(m[3])
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			d := c
-			if len(m[4]) > 0 {
-				d, err = strconv.Atoi(m[4])
-				if err != nil {
-					return nil, errors.Trace(err)
-				}
-			}
-
-			// hunk orig range.
-			hunk.OrigRange = diffRange{
-				Start:  a,
-				Length: b,
-			}
-
-			// hunk new range.
-			hunk.NewRange = diffRange{
-				Start:  c,
-				Length: d,
-			}
-
-			// (re)set line counts
-			ADDEDCount = hunk.NewRange.Start
-			REMOVEDCount = hunk.OrigRange.Start
-		case inHunk && isSourceLine(l):
-			m, err := lineMode(l)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			line := DiffLine{
-				Mode:     *m,
-				Content:  l[1:],
-				Position: diffPosCount,
-			}
-			newLine := line
-			origLine := line
-
-			// add lines to ranges
-			switch *m {
-			case ADDED:
-				newLine.Number = ADDEDCount
-				hunk.NewRange.Lines = append(hunk.NewRange.Lines, &newLine)
-				ADDEDCount++
-
-			case REMOVED:
-				origLine.Number = REMOVEDCount
-				hunk.OrigRange.Lines = append(hunk.OrigRange.Lines, &origLine)
-				REMOVEDCount++
-
-			case UNCHANGED:
-				newLine.Number = ADDEDCount
-				hunk.NewRange.Lines = append(hunk.NewRange.Lines, &newLine)
-				origLine.Number = REMOVEDCount
-				hunk.OrigRange.Lines = append(hunk.OrigRange.Lines, &origLine)
-				ADDEDCount++
-				REMOVEDCount++
+				eh.appendError(err)
 			}
 		}
-	}
 
-	return &diff, nil
+		// hunk orig range.
+		hunk.OrigRange = diffRange{
+			Start:  a,
+			Length: b,
+		}
+
+		// hunk new range.
+		hunk.NewRange = diffRange{
+			Start:  c,
+			Length: d,
+		}
+
+		// (re)set line counts
+		ADDEDCount = hunk.NewRange.Start
+		REMOVEDCount = hunk.OrigRange.Start
+	case inHunk && isSourceLine(l):
+		m, err := lineMode(l)
+		if err != nil {
+			eh.appendError(err)
+		}
+		line := DiffLine{
+			Mode:     *m,
+			Content:  l[1:],
+			Position: diffPosCount,
+		}
+		newLine := line
+		origLine := line
+
+		// add lines to ranges
+		switch *m {
+		case ADDED:
+			newLine.Number = ADDEDCount
+			hunk.NewRange.Lines = append(hunk.NewRange.Lines, &newLine)
+			ADDEDCount++
+
+		case REMOVED:
+			origLine.Number = REMOVEDCount
+			hunk.OrigRange.Lines = append(hunk.OrigRange.Lines, &origLine)
+			REMOVEDCount++
+
+		case UNCHANGED:
+			newLine.Number = ADDEDCount
+			hunk.NewRange.Lines = append(hunk.NewRange.Lines, &newLine)
+			origLine.Number = REMOVEDCount
+			hunk.OrigRange.Lines = append(hunk.OrigRange.Lines, &origLine)
+			ADDEDCount++
+			REMOVEDCount++
+		}
+	}
 }
 
 func isSourceLine(line string) bool {

@@ -7,9 +7,9 @@ import (
 	"io/ioutil"
 	"testing"
 
+	"github.com/jfo84/diffparser"
 	jt "github.com/juju/testing"
 	jc "github.com/juju/testing/checkers"
-	"github.com/waigani/diffparser"
 	gc "gopkg.in/check.v1"
 )
 
