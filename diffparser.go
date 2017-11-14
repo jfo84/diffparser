@@ -194,10 +194,10 @@ func generateFiles(wg *sync.WaitGroup, eh *errorHandler, diff *Diff, diffPosCoun
 		file.Mode = DELETED
 	case l == "--- /dev/null":
 		file.Mode = NEW
-	// case strings.HasPrefix(l, oldFilePrefix):
-	// 	file.OrigName = strings.TrimPrefix(l, oldFilePrefix)
-	// case strings.HasPrefix(l, newFilePrefix):
-	// 	file.NewName = strings.TrimPrefix(l, newFilePrefix)
+	case strings.HasPrefix(l, oldFilePrefix):
+		file.OrigName = strings.TrimPrefix(l, oldFilePrefix)
+	case strings.HasPrefix(l, newFilePrefix):
+		file.NewName = strings.TrimPrefix(l, newFilePrefix)
 	case strings.HasPrefix(l, "@@ "):
 		if firstHunkInFile {
 			diffPosCount = 0
